@@ -1,21 +1,32 @@
-.ipynb_checkpoints
-*/.ipynb_checkpoints/*
+# Data caches
+shift_cache/
+pbp_cache_2025_26/
+roster_cache/
+roster_cache_all_games/
+moneypuck_data/
 
-/.quarto/
-/_manuscript
+# Large R data/cache files
+*.rds
 
-/agujournal2019.cls
-/trackchanges.sty
-.Rproj.user
+# MoneyPuck downloads
+shots_*.zip
+shots_*.csv
+
+# Generated datasets
+nhl_2025_26_player_shift_data.csv
+nhl_2025_26_dz_faceoff_events_all.csv
+nhl_2025_26_icing_faceoff_model_data.csv
+nhl_2025_26_icing_on_ice_players.csv
+flagged_long_shifts.csv
+
+# RStudio / Quarto generated state
+.Rproj.user/
+.quarto/
+README_files/
+.RData
 .Rhistory
-.Rdata
-.httr-oauth
+.Ruserdata
+
+# macOS
 .DS_Store
-.positai
-
-**/*.quarto_ipynb
-
-# derivative files
-site_libs/
-_freeze/
-*_files/
+._*

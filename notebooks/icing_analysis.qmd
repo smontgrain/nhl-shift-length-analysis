@@ -1,0 +1,89 @@
+---
+title: "icing_analysis"
+format: html
+---
+
+```{r}
+library(data.table)
+library(ggplot2)
+final <- read.csv("nhl_2025_26_player_shift_data.csv")
+setorder(shift_ivl, shift_id, interval_start)
+shift_strength <- shift_ivl[, .(strength = first(strength)), by = shift_id]
+```
+
+ 1. For each icing-flagged shift, get how long the player had
+    already been on the ice at the moment of the icing
+
+```{r}
+icing_moment_strength <- shift_ivl[
+  is_icing_moment == TRUE,
+  .(shift_id, strength_at_icing = strength)
+]
+
+# ------------------------------------------------------------
+# 2. Build per-shift icing info: who, when in the shift it
+#    happened, and what strength state it was at that moment
+# ------------------------------------------------------------
+icing_shifts_info <- shifts[
+  has_icing == TRUE,
+  .(shift_id, player_id, team, shift_start, shift_end)
+]
+icing_shifts_info <- merge(icing_shifts_info, icing_interval_lookup, by = "shift_id")
+icing_shifts_info <- merge(icing_shifts_info, icing_moment_strength, by = "shift_id")
+icing_shifts_info[, time_in_shift_at_icing := icing_interval_start - shift_start]
+
+# filter to EV-only icings
+icing_shifts_info <- icing_shifts_info[strength_at_icing == "EV"]
+
+# ------------------------------------------------------------
+# 3. Sum xGA/xGF for the portion of each shift AFTER the icing
+#    (strictly after -- the interval containing the icing itself
+#    is excluded since the whistle could occur anywhere within it)
+# ------------------------------------------------------------
+post_icing_xg <- shift_ivl[
+  shift_id %in% icing_shifts_info$shift_id,
+  .(interval_start, xGA, xGF, icing_interval_start)
+][
+  interval_start > icing_interval_start,
+  .(
+    post_icing_xGA = sum(xGA),
+    post_icing_xGF = sum(xGF),
+    post_icing_seconds = .N * 5L
+  ),
+  by = shift_id
+]
+
+# ------------------------------------------------------------
+# 4. Combine and normalize xGA/xGF by actual post-icing exposure
+#    time, so buckets with less remaining shift time aren't
+#    penalized just for having less time to accumulate xG
+# ------------------------------------------------------------
+icing_analysis <- merge(
+  icing_shifts_info[, .(shift_id, player_id, team, time_in_shift_at_icing)],
+  post_icing_xg,
+  by = "shift_id"
+)
+
+icing_analysis[, xGA_per_60 := post_icing_xGA / post_icing_seconds * 60]
+icing_analysis[, xGF_per_60 := post_icing_xGF / post_icing_seconds * 60]
+
+# ------------------------------------------------------------
+# 5. Bucket by how long they'd already been on the ice when
+#    they iced the puck
+# ------------------------------------------------------------
+icing_analysis[, time_bucket := cut(
+  time_in_shift_at_icing,
+  breaks = c(-1, 15, 30, 45, 60, Inf),
+  labels = c("0-15s", "15-30s", "30-45s", "45-60s", "60s+")
+)]
+
+icing_summary_ev <- icing_analysis[, .(
+  n_player_shifts = .N,
+  avg_post_icing_seconds = round(mean(post_icing_seconds), 1),
+  mean_xGA_per_60 = round(mean(xGA_per_60), 3),
+  mean_xGF_per_60 = round(mean(xGF_per_60), 3)
+), by = time_bucket]
+
+setorder(icing_summary_ev, time_bucket)
+print(icing_summary_ev)
+```
