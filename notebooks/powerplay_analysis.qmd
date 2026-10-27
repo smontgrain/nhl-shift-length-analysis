@@ -1,0 +1,120 @@
+---
+title: "powerplay_analysis"
+format: html
+---
+
+##Setup
+```{r}
+library(data.table)
+library(ggplot2)
+final <- read.csv("nhl_2025_26_player_shift_data.csv")
+setorder(shift_ivl, shift_id, interval_start)
+shift_strength <- shift_ivl[, .(strength = first(strength)), by = shift_id]
+```
+
+
+
+#Building Shift Elapsed Time
+```{r}
+setDT(final)
+setorder(final, game_id, player_id, period, interval_start)
+
+# a new shift starts whenever there's a gap in interval_start
+# (or it's the player's very first interval in that period)
+final[, gap := interval_start - shift(interval_start, 1L, type = "lag"),
+      by = .(game_id, player_id, period)]
+final[, new_shift := is.na(gap) | gap > 5]
+final[, shift_num := cumsum(new_shift), by = .(game_id, player_id, period)]
+
+# time elapsed since THAT shift began (0-5, 5-10, 45-50, etc.)
+final[, shift_start_time := min(interval_start),
+      by = .(game_id, player_id, period, shift_num)]
+final[, time_in_shift := interval_start - shift_start_time]
+
+xgf_by_shift_time <- final[, .(mean_xGF = mean(xGF), n = .N), by = time_in_shift]
+setorder(xgf_by_shift_time, time_in_shift)
+
+#test
+#xgf_by_shift_time[time_in_shift %in% seq(0, 150, 15)]
+```
+
+
+```{r}
+setDT(final)
+setorder(final, game_id, player_id, period, interval_start)
+
+# a new shift starts whenever there's a gap in interval_start
+# (or it's the player's very first interval in that period)
+final[, gap := interval_start - shift(interval_start, 1L, type = "lag"),
+      by = .(game_id, player_id, period)]
+final[, new_shift := is.na(gap) | gap > 5]
+final[, shift_num := cumsum(new_shift), by = .(game_id, player_id, period)]
+
+# time elapsed since THAT shift began (0-5, 5-10, 45-50, etc.)
+final[, shift_start_time := min(interval_start),
+      by = .(game_id, player_id, period, shift_num)]
+final[, time_in_shift := interval_start - shift_start_time]
+
+xgf_by_shift_time <- final[, .(mean_xGF = mean(xGF), n = .N), by = time_in_shift]
+setorder(xgf_by_shift_time, time_in_shift)
+
+#test
+#xgf_by_shift_time[time_in_shift %in% seq(0, 150, 15)]
+```
+
+#Plot 5 on 5
+
+
+```{r}
+xgf_by_shift_time_5v5 <- final[strength == "PP" & has_stoppage == FALSE,
+                                .(mean_xGF = mean(xGF), n = .N),
+                                by = time_in_shift]
+setorder(xgf_by_shift_time_5v5, time_in_shift)
+
+xga_by_shift_time_5v5 <- final[strength == "PP" & has_stoppage == FALSE,
+                                .(mean_xGA = mean(xGA), n = .N),
+                                by = time_in_shift]
+setorder(xga_by_shift_time_5v5, time_in_shift)
+
+xg_margin_by_shift_time_5v5 <- merge(
+  xgf_by_shift_time_5v5[, .(time_in_shift, mean_xGF, n)],
+  xga_by_shift_time_5v5[, .(time_in_shift, mean_xGA)],
+  by = "time_in_shift"
+)
+
+xg_margin_by_shift_time_5v5[, xg_margin := mean_xGF - mean_xGA]
+setorder(xg_margin_by_shift_time_5v5, time_in_shift)
+
+#xgf_by_shift_time_5v5[time_in_shift %in% seq(0, 150, 15)]  # table
+
+combined <- rbind(
+  xgf_by_shift_time_5v5[, .(time_in_shift, value = mean_xGF, metric = "xGF")],
+  xga_by_shift_time_5v5[, .(time_in_shift, value = mean_xGA, metric = "xGA")]
+)
+
+ggplot(combined[time_in_shift <= 120],
+       aes(x = time_in_shift, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("xGF" = "steelblue", "xGA" = "firebrick")) +
+  labs(
+    title = "Average xGF vs xGA by Time on Ice (5-on-5 only)",
+    x = "Seconds into current shift",
+    y = "Average value per 5-second interval",
+    color = NULL
+  ) +
+  theme_bw()
+
+ggplot(xg_margin_by_shift_time_5v5[time_in_shift <= 90],
+       aes(x = time_in_shift, y = xg_margin)) +
+  geom_line(color = "darkgreen", linewidth = 1) +
+  geom_point(size = 1.5, color = "darkgreen") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  labs(
+    title = "xG Margin by Time on Ice (5-on-5 only)",
+    x = "Seconds into current shift",
+    y = "xGF − xGA per 5-second interval"
+  ) +
+  theme_bw()
+```
+

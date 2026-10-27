@@ -1,0 +1,1330 @@
+---
+title: "performance_analysis_5_on_5"
+format: html
+---
+
+
+# Setup 
+```{r}
+library(data.table)
+library(ggplot2)
+
+final <- fread(
+  "nhl_2025_26_player_shift_data.csv",
+  select = c(
+    "game_id", "team", "opp_team", "period", "interval_start",
+    "player_id", "fwd_def", "is_5v5", "shift_age_mid_sec",
+    "xGF_5v5", "xGA_5v5", "score_diff"
+  )
+)
+
+setDT(final)
+
+required_columns <- c(
+  "game_id", "team", "opp_team", "period", "interval_start",
+  "player_id", "fwd_def", "is_5v5", "shift_age_mid_sec",
+  "xGF_5v5", "xGA_5v5", "score_diff"
+)
+
+missing_columns <- setdiff(required_columns, names(final))
+
+if (length(missing_columns) > 0L) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+safe_mean <- function(x) {
+  if (length(x) == 0L || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  mean(x, na.rm = TRUE)
+}
+
+safe_max <- function(x) {
+  if (length(x) == 0L || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  max(x, na.rm = TRUE)
+}
+
+# Collapse directly to one team x 5-second interval row
+team_5v5 <- final[
+  is_5v5 == 1L &
+    !is.na(player_id) &
+    !is.na(shift_age_mid_sec),
+  .(
+    opp_team = first(opp_team),
+    score_diff = first(score_diff),
+
+    n_skaters = uniqueN(player_id),
+
+    n_forwards = uniqueN(
+      player_id[fwd_def == "Forward"]
+    ),
+
+    n_defense = uniqueN(
+      player_id[fwd_def == "Defense"]
+    ),
+
+    mean_shift_age_sec = safe_mean(
+      shift_age_mid_sec
+    ),
+
+    median_shift_age_sec = median(
+      shift_age_mid_sec,
+      na.rm = TRUE
+    ),
+
+    max_shift_age_sec = safe_max(
+      shift_age_mid_sec
+    ),
+
+    mean_forward_shift_age_sec = safe_mean(
+      shift_age_mid_sec[fwd_def == "Forward"]
+    ),
+
+    mean_defense_shift_age_sec = safe_mean(
+      shift_age_mid_sec[fwd_def == "Defense"]
+    ),
+
+    xGF_5v5 = first(xGF_5v5),
+    xGA_5v5 = first(xGA_5v5)
+  ),
+  by = .(
+    game_id,
+    team,
+    period,
+    interval_start
+  )
+]
+
+# Keep only standard 5-skater units
+team_5v5 <- team_5v5[
+  n_skaters == 5L &
+    n_forwards == 3L &
+    n_defense == 2L
+]
+
+fwrite(
+  team_5v5,
+  "nhl_2025_26_team_interval_5v5.csv"
+)
+
+cat(
+  "Valid 5v5 team intervals:",
+  nrow(team_5v5),
+  "\n"
+)
+
+# Free the huge player-level file from memory
+rm(final)
+gc()
+```
+continued
+```{r}
+BIN_SECONDS <- 5L
+
+team_5v5[
+  ,
+  unit_shift_age_sec := mean_shift_age_sec
+]
+
+team_5v5[
+  ,
+  shift_age_bin := BIN_SECONDS * floor(unit_shift_age_sec / BIN_SECONDS)
+]
+
+xg_by_shift_age <- team_5v5[
+  shift_age_bin <= 90,
+  .(
+    mean_xGF = mean(xGF_5v5, na.rm = TRUE),
+    mean_xGA = mean(xGA_5v5, na.rm = TRUE),
+    mean_margin = mean(xGF_5v5 - xGA_5v5, na.rm = TRUE),
+    n_intervals = .N,
+    n_games = uniqueN(game_id)
+  ),
+  by = shift_age_bin
+]
+
+setorder(xg_by_shift_age, shift_age_bin)
+
+combined <- melt(
+  xg_by_shift_age,
+  id.vars = c("shift_age_bin", "n_intervals", "n_games"),
+  measure.vars = c("mean_xGF", "mean_xGA"),
+  variable.name = "metric",
+  value.name = "value"
+)
+
+combined[
+  ,
+  metric := fcase(
+    metric == "mean_xGF", "xGF",
+    metric == "mean_xGA", "xGA"
+  )
+]
+
+xgf_xgf_5v5 <- ggplot(
+  combined,
+  aes(
+    x = shift_age_bin,
+    y = value,
+    color = metric
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  scale_color_manual(
+    values = c(
+      "xGF" = "steelblue",
+      "xGA" = "firebrick"
+    )
+  ) +
+  labs(
+    title = "Average 5v5 xGF and xGA by Unit Shift Length",
+    subtitle = "Average xG per 5-second interval",,
+    x = "Average unit shift age (5-second bins)",
+    y = "",
+    color = NULL
+  ) +
+  theme_bw()
+
+xgf_xgf_5v5
+
+ggsave(
+  "../images/xgf_xga_5v5.png",
+  plot = xgf_xgf_5v5,
+  width = 7,
+  height = 4.5,
+  dpi = 300
+)
+```
+Margin CI
+```{r}
+library(sandwich)
+library(lmtest)
+
+
+# xG margin for each team 5-second interval
+team_5v5[
+  ,
+  xg_margin := xGF_5v5 - xGA_5v5
+]
+
+# Keep the plotted range
+margin_model_data <- team_5v5[
+  shift_age_bin <= 90 &
+    !is.na(xg_margin) &
+    !is.na(shift_age_bin)
+]
+
+# One coefficient for each shift-age bin
+margin_model <- lm(
+  xg_margin ~ factor(shift_age_bin) - 1,
+  data = margin_model_data
+)
+
+# Standard errors clustered by game
+margin_test <- coeftest(
+  margin_model,
+  vcov = vcovCL(
+    margin_model,
+    cluster = ~ game_id
+  )
+)
+
+# Build plotting table
+margin_by_shift_age <- data.table(
+  shift_age_bin = sort(
+    unique(margin_model_data$shift_age_bin)
+  ),
+  mean_margin = margin_test[, "Estimate"],
+  se = margin_test[, "Std. Error"]
+)
+
+# 95% confidence intervals
+margin_by_shift_age[
+  ,
+  `:=`(
+    ymin = mean_margin - 1.96 * se,
+    ymax = mean_margin + 1.96 * se
+  )
+]
+
+# Add interval/game counts for reference
+sample_sizes <- margin_model_data[
+  ,
+  .(
+    n_intervals = .N,
+    n_games = uniqueN(game_id)
+  ),
+  by = shift_age_bin
+]
+
+margin_by_shift_age <- merge(
+  margin_by_shift_age,
+  sample_sizes,
+  by = "shift_age_bin",
+  all.x = TRUE
+)
+
+setorder(
+  margin_by_shift_age,
+  shift_age_bin
+)
+
+xg_margin_5v5 <- ggplot(
+  margin_by_shift_age,
+  aes(
+    x = shift_age_bin,
+    y = mean_margin
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = ymin,
+      ymax = ymax
+    ),
+    fill = "darkgreen",
+    alpha = 0.2
+  ) +
+  geom_line(
+    color = "darkgreen",
+    linewidth = 1
+  ) +
+  geom_point(
+    size = 1.5,
+    color = "darkgreen"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  labs(
+    title = "5v5 xG Margin by Unit Shift Length",
+    subtitle = "95% CI with standard errors clustered by game",
+    x = "Average unit shift age (5-second bins)",
+    y = "xG Margin"
+  ) +
+  theme_bw()
+xg_margin_5v5
+
+ggsave(
+  "../images/xg_margin_5v5.png",
+  plot = xg_margin_5v5,
+  width = 7,
+  height = 4.5,
+  dpi = 300
+)
+```
+
+
+
+# linear model
+#game clustered SE
+```{r}
+team_5v5[, xg_margin := xGF_5v5 - xGA_5v5]
+
+model_data <- team_5v5[
+  unit_shift_age_sec <= 90 &
+    !is.na(xg_margin) &
+    !is.na(unit_shift_age_sec)
+]
+
+m1 <- lm(
+  xg_margin ~ unit_shift_age_sec,
+  data = model_data
+)
+
+coeftest(
+  m1,
+  vcov = vcovCL(
+    m1,
+    cluster = ~ game_id
+  )
+)
+
+# Game-clustered covariance matrix
+V_m1 <- vcovCL(
+  m1,
+  cluster = ~ game_id
+)
+
+# Regression coefficient per second
+beta <- coef(m1)["unit_shift_age_sec"]
+
+# Game-clustered standard error
+se_beta <- sqrt(
+  V_m1["unit_shift_age_sec", "unit_shift_age_sec"]
+)
+
+# p-value from clustered coefficient test
+m1_test <- coeftest(
+  m1,
+  vcov = V_m1
+)
+
+p_value <- m1_test[
+  "unit_shift_age_sec",
+  "Pr(>|t|)"
+]
+
+# Convert to a 30-second association
+regression_results <- data.table(
+  effect_per_30_sec = 30 * beta,
+  lower_95 = 30 * (beta - 1.96 * se_beta),
+  upper_95 = 30 * (beta + 1.96 * se_beta),
+  p_value = p_value
+)
+
+regression_results
+```
+
+
+#5 on 5 effect
+```{r}
+team_5v5[
+  ,
+  shift_length_group := cut(
+    unit_shift_age_sec,
+    breaks = c(-Inf, 30, 45, 60, Inf),
+    labels = c(
+      "0-30",
+      "30-45",
+      "45-60",
+      "60+"
+    ),
+    right = FALSE
+  )
+]
+
+shift_effect <- team_5v5[
+  ,
+  .(
+    xGF = mean(xGF_5v5, na.rm = TRUE),
+    xGA = mean(xGA_5v5, na.rm = TRUE),
+    xG_margin = mean(xGF_5v5 - xGA_5v5, na.rm = TRUE),
+    n_intervals = .N,
+    n_games = uniqueN(game_id)
+  ),
+  by = shift_length_group
+]
+
+shift_effect
+
+short_shift <- shift_effect[
+  shift_length_group == "0-30"
+]
+
+long_shift <- shift_effect[
+  shift_length_group == "60+"
+]
+
+xgf_drop_pct <- 100 * (
+  short_shift$xGF - long_shift$xGF
+) / short_shift$xGF
+
+xga_increase_pct <- 100 * (
+  long_shift$xGA - short_shift$xGA
+) / short_shift$xGA
+
+xgf_drop_pct
+xga_increase_pct
+```
+
+During the first 30 seconds of a shift, teams had an average 5v5 xG differential of +0.000254 per 5-second interval. Once the average unit shift age reached 60 seconds or more, the differential fell to −0.001143. Compared with the first 30 seconds, xGF decreased by approximately 38.22% while xGA increased by approximately 25.85%.
+
+
+#compared to penalty kill
+```{r}
+# ------------------------------------------------------------
+# Average xGA:
+# exact 5v5 vs penalty kill
+# One team x 5-second interval = one observation
+# ------------------------------------------------------------
+
+# Load only columns needed for 5v5 vs PK comparison
+strength_data <- fread(
+  "nhl_2025_26_player_shift_data.csv",
+  select = c(
+    "game_id",
+    "team",
+    "period",
+    "interval_start",
+    "is_5v5",
+    "strength",
+    "xGA"
+  )
+)
+
+xga_compare <- strength_data[
+  is_5v5 == 1L | strength == "PK",
+  .(
+    state = fifelse(
+      first(is_5v5) == 1L,
+      "5v5",
+      "Penalty Kill"
+    ),
+    xGA = first(xGA)
+  ),
+  by = .(
+    game_id,
+    team,
+    period,
+    interval_start
+  )
+]
+
+
+# Average xGA in each state
+xga_summary <- xga_compare[
+  ,
+  .(
+    mean_xGA = mean(xGA, na.rm = TRUE),
+    n_intervals = .N,
+    n_games = uniqueN(game_id)
+  ),
+  by = state
+]
+
+xga_summary
+
+xga_5v5 <- xga_summary[
+  state == "5v5",
+  mean_xGA
+]
+
+xga_pk <- xga_summary[
+  state == "Penalty Kill",
+  mean_xGA
+]
+
+pk_xga_increase_pct <-
+  100 * (xga_pk - xga_5v5) / xga_5v5
+
+pk_xga_increase_pct
+
+relative_size <-
+  xga_increase_pct / pk_xga_increase_pct
+
+100 * relative_size
+
+rm(strength_data, xga_compare)
+gc()
+```
+When a team takes a penalty and goes on the penalty kill they see around a 64.7% increase in xGA compared to 5 on 5. At 5v5, average xGA was approximately 25.85% higher when average unit shift age reached 60+ seconds compared with the first 30 seconds of a shift.
+
+The increase in xGA associated with a 60+ second 5v5 shift is about 39.96% as large as the increase in xGA associated with going on the penalty kill.
+
+
+#Cutoff Determination
+```{r}
+library(gt)
+
+shift_age_support <- team_5v5[
+  ,
+  .(
+    n_intervals = .N,
+    n_games = uniqueN(game_id)),
+  by = shift_age_bin
+]
+
+setorder(
+  shift_age_support,
+  shift_age_bin
+)
+
+shift_age_support[
+  ,
+  pct_of_intervals :=
+    100 * n_intervals / sum(n_intervals)
+]
+
+shift_age_support[
+  shift_age_bin <= 120
+] |>
+  gt() |>
+  cols_label(
+    shift_age_bin = "Shift Age (sec)",
+    n_intervals = "5-Second Intervals",
+    n_games = "Games",
+    pct_of_intervals = "Percent of Intervals"
+  ) |>
+  fmt_number(
+    columns = pct_of_intervals,
+    decimals = 2
+  ) |>
+  text_transform(
+    locations = cells_body(
+      columns = pct_of_intervals
+    ),
+    fn = function(x) paste0(x, "%")
+  ) |>
+  fmt_integer(
+    columns = c(
+      n_intervals,
+      n_games,
+    ),
+    use_seps = TRUE
+  ) |>
+  tab_header(
+    title = "Sample Size by Average Unit Shift Age",
+    subtitle = "Exact 5-on-5 team intervals"
+  )
+```
+
+
+
+
+
+
+
+
+
+#all needed Confidence Intervals and bootstrapping
+```{r}
+# ============================================================
+# CONFIDENCE INTERVALS FOR MAIN 5v5 RESULTS
+# ============================================================
+
+library(data.table)
+library(sandwich)
+library(lmtest)
+
+# Make sure margin exists
+team_5v5[
+  ,
+  xg_margin := xGF_5v5 - xGA_5v5
+]
+
+# ------------------------------------------------------------
+# 1. 0-30 vs 60+:
+#    clustered CIs for xG margin
+# ------------------------------------------------------------
+
+compare_data <- team_5v5[
+  unit_shift_age_sec < 30 |
+    unit_shift_age_sec >= 60
+]
+
+compare_data[
+  ,
+  long_shift := as.integer(
+    unit_shift_age_sec >= 60
+  )
+]
+
+m_margin <- lm(
+  xg_margin ~ long_shift,
+  data = compare_data
+)
+
+margin_vcov <- vcovCL(
+  m_margin,
+  cluster = ~ game_id
+)
+
+margin_test <- coeftest(
+  m_margin,
+  vcov = margin_vcov
+)
+
+margin_test
+
+
+# Coefficients and covariance matrix
+b <- coef(m_margin)
+V <- margin_vcov
+
+
+# 0-30 mean
+margin_0_30 <- b["(Intercept)"]
+
+se_0_30 <- sqrt(
+  V[
+    "(Intercept)",
+    "(Intercept)"
+  ]
+)
+
+
+# 60+ mean
+margin_60_plus <-
+  b["(Intercept)"] +
+  b["long_shift"]
+
+se_60_plus <- sqrt(
+  V["(Intercept)", "(Intercept)"] +
+    V["long_shift", "long_shift"] +
+    2 * V["(Intercept)", "long_shift"]
+)
+
+
+# Difference:
+# 60+ minus 0-30
+margin_difference <-
+  b["long_shift"]
+
+se_difference <- sqrt(
+  V["long_shift", "long_shift"]
+)
+
+
+margin_results <- data.table(
+  result = c(
+    "0-30 mean margin",
+    "60+ mean margin",
+    "60+ minus 0-30"
+  ),
+
+  estimate = c(
+    margin_0_30,
+    margin_60_plus,
+    margin_difference
+  ),
+
+  lower = c(
+    margin_0_30 - 1.96 * se_0_30,
+    margin_60_plus - 1.96 * se_60_plus,
+    margin_difference - 1.96 * se_difference
+  ),
+
+  upper = c(
+    margin_0_30 + 1.96 * se_0_30,
+    margin_60_plus + 1.96 * se_60_plus,
+    margin_difference + 1.96 * se_difference
+  )
+)
+
+margin_results
+
+
+# ============================================================
+# 2. FAST GAME-CLUSTER BOOTSTRAP
+#
+# Gives CIs for:
+#   - xGF percentage decrease
+#   - xGA percentage increase
+#   - PK xGA increase
+#   - relative size of long-shift effect vs PK effect
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 2a. Collapse 5v5 long/short data to GAME LEVEL
+# ------------------------------------------------------------
+
+game_5v5_stats <- team_5v5[
+  ,
+  .(
+    # 0-30 xGF
+    short_xgf_sum = sum(
+      xGF_5v5[
+        unit_shift_age_sec < 30
+      ],
+      na.rm = TRUE
+    ),
+
+    short_xgf_n = sum(
+      unit_shift_age_sec < 30 &
+        !is.na(xGF_5v5)
+    ),
+
+    # 0-30 xGA
+    short_xga_sum = sum(
+      xGA_5v5[
+        unit_shift_age_sec < 30
+      ],
+      na.rm = TRUE
+    ),
+
+    short_xga_n = sum(
+      unit_shift_age_sec < 30 &
+        !is.na(xGA_5v5)
+    ),
+
+    # 60+ xGF
+    long_xgf_sum = sum(
+      xGF_5v5[
+        unit_shift_age_sec >= 60
+      ],
+      na.rm = TRUE
+    ),
+
+    long_xgf_n = sum(
+      unit_shift_age_sec >= 60 &
+        !is.na(xGF_5v5)
+    ),
+
+    # 60+ xGA
+    long_xga_sum = sum(
+      xGA_5v5[
+        unit_shift_age_sec >= 60
+      ],
+      na.rm = TRUE
+    ),
+
+    long_xga_n = sum(
+      unit_shift_age_sec >= 60 &
+        !is.na(xGA_5v5)
+    )
+  ),
+  by = game_id
+]
+
+
+# ------------------------------------------------------------
+# 2b. Load only columns needed for 5v5 vs PK comparison
+# ------------------------------------------------------------
+
+strength_data <- fread(
+  "nhl_2025_26_player_shift_data.csv",
+  select = c(
+    "game_id",
+    "team",
+    "period",
+    "interval_start",
+    "is_5v5",
+    "strength",
+    "xGA"
+  )
+)
+
+
+# Restrict to games retained in the main analysis
+valid_game_ids <- unique(
+  team_5v5$game_id
+)
+
+strength_data <- strength_data[
+  game_id %in% valid_game_ids
+]
+
+
+# One team x 5-second interval = one row
+strength_team <- strength_data[
+  is_5v5 == 1L |
+    strength == "PK",
+  .(
+    state = fifelse(
+      first(is_5v5) == 1L,
+      "5v5",
+      "Penalty Kill"
+    ),
+
+    xGA = first(xGA)
+  ),
+  by = .(
+    game_id,
+    team,
+    period,
+    interval_start
+  )
+]
+
+
+# ------------------------------------------------------------
+# 2c. Collapse 5v5 / PK comparison to GAME LEVEL
+# ------------------------------------------------------------
+
+game_strength_stats <- strength_team[
+  ,
+  .(
+    five_xga_sum = sum(
+      xGA[state == "5v5"],
+      na.rm = TRUE
+    ),
+
+    five_xga_n = sum(
+      state == "5v5" &
+        !is.na(xGA)
+    ),
+
+    pk_xga_sum = sum(
+      xGA[state == "Penalty Kill"],
+      na.rm = TRUE
+    ),
+
+    pk_xga_n = sum(
+      state == "Penalty Kill" &
+        !is.na(xGA)
+    )
+  ),
+  by = game_id
+]
+
+
+# Merge the two game-level tables
+boot_game_stats <- merge(
+  game_5v5_stats,
+  game_strength_stats,
+  by = "game_id",
+  all.x = TRUE
+)
+
+
+# Missing PK values mean that game contributed no PK intervals
+boot_game_stats[
+  is.na(pk_xga_sum),
+  pk_xga_sum := 0
+]
+
+boot_game_stats[
+  is.na(pk_xga_n),
+  pk_xga_n := 0
+]
+
+
+# ============================================================
+# 3. POINT ESTIMATES FROM FULL DATA
+# ============================================================
+
+short_xgf <-
+  sum(boot_game_stats$short_xgf_sum) /
+  sum(boot_game_stats$short_xgf_n)
+
+long_xgf <-
+  sum(boot_game_stats$long_xgf_sum) /
+  sum(boot_game_stats$long_xgf_n)
+
+short_xga <-
+  sum(boot_game_stats$short_xga_sum) /
+  sum(boot_game_stats$short_xga_n)
+
+long_xga <-
+  sum(boot_game_stats$long_xga_sum) /
+  sum(boot_game_stats$long_xga_n)
+
+
+xgf_drop_pct <-
+  100 *
+  (short_xgf - long_xgf) /
+  short_xgf
+
+xga_increase_pct <-
+  100 *
+  (long_xga - short_xga) /
+  short_xga
+
+
+five_xga <-
+  sum(boot_game_stats$five_xga_sum) /
+  sum(boot_game_stats$five_xga_n)
+
+pk_xga <-
+  sum(boot_game_stats$pk_xga_sum) /
+  sum(boot_game_stats$pk_xga_n)
+
+pk_xga_increase_pct <-
+  100 *
+  (pk_xga - five_xga) /
+  five_xga
+
+
+relative_size_pct <-
+  100 *
+  xga_increase_pct /
+  pk_xga_increase_pct
+
+
+cat(
+  "\nxGF decrease:",
+  round(xgf_drop_pct, 2),
+  "%\n"
+)
+
+cat(
+  "xGA increase:",
+  round(xga_increase_pct, 2),
+  "%\n"
+)
+
+cat(
+  "PK xGA increase:",
+  round(pk_xga_increase_pct, 2),
+  "%\n"
+)
+
+cat(
+  "Long-shift increase as % of PK increase:",
+  round(relative_size_pct, 2),
+  "%\n"
+)
+
+
+# ============================================================
+# 4. GAME-CLUSTER BOOTSTRAP
+# ============================================================
+
+set.seed(123)
+
+B <- 1000L
+n_games <- nrow(boot_game_stats)
+
+boot_results <- vector(
+  "list",
+  B
+)
+
+
+for (b in seq_len(B)) {
+
+  # Sample entire games with replacement
+  idx <- sample.int(
+    n_games,
+    n_games,
+    replace = TRUE
+  )
+
+  z <- boot_game_stats[idx]
+
+
+  # ----------------------------------------
+  # Short vs long 5v5 means
+  # ----------------------------------------
+
+  b_short_xgf <-
+    sum(z$short_xgf_sum) /
+    sum(z$short_xgf_n)
+
+  b_long_xgf <-
+    sum(z$long_xgf_sum) /
+    sum(z$long_xgf_n)
+
+  b_short_xga <-
+    sum(z$short_xga_sum) /
+    sum(z$short_xga_n)
+
+  b_long_xga <-
+    sum(z$long_xga_sum) /
+    sum(z$long_xga_n)
+
+
+  b_xgf_drop_pct <-
+    100 *
+    (b_short_xgf - b_long_xgf) /
+    b_short_xgf
+
+  b_xga_increase_pct <-
+    100 *
+    (b_long_xga - b_short_xga) /
+    b_short_xga
+
+
+  # ----------------------------------------
+  # 5v5 vs PK
+  # ----------------------------------------
+
+  b_five_xga <-
+    sum(z$five_xga_sum) /
+    sum(z$five_xga_n)
+
+  b_pk_xga <-
+    sum(z$pk_xga_sum) /
+    sum(z$pk_xga_n)
+
+
+  b_pk_increase_pct <-
+    100 *
+    (b_pk_xga - b_five_xga) /
+    b_five_xga
+
+
+  # ----------------------------------------
+  # Relative size
+  # ----------------------------------------
+
+  b_relative_size_pct <-
+    100 *
+    b_xga_increase_pct /
+    b_pk_increase_pct
+
+
+  boot_results[[b]] <- data.table(
+    xgf_drop_pct =
+      b_xgf_drop_pct,
+
+    xga_increase_pct =
+      b_xga_increase_pct,
+
+    pk_xga_increase_pct =
+      b_pk_increase_pct,
+
+    relative_size_pct =
+      b_relative_size_pct
+  )
+}
+
+
+boot_results <- rbindlist(
+  boot_results
+)
+
+
+# ============================================================
+# 5. BOOTSTRAP 95% CONFIDENCE INTERVALS
+# ============================================================
+
+bootstrap_ci <- data.table(
+  measure = c(
+    "xGF decrease: 0-30 vs 60+",
+    "xGA increase: 0-30 vs 60+",
+    "PK xGA increase vs 5v5",
+    "Long-shift xGA increase relative to PK"
+  ),
+
+  estimate = c(
+    xgf_drop_pct,
+    xga_increase_pct,
+    pk_xga_increase_pct,
+    relative_size_pct
+  ),
+
+  lower_95 = c(
+    quantile(
+      boot_results$xgf_drop_pct,
+      0.025,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$xga_increase_pct,
+      0.025,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$pk_xga_increase_pct,
+      0.025,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$relative_size_pct,
+      0.025,
+      na.rm = TRUE
+    )
+  ),
+
+  upper_95 = c(
+    quantile(
+      boot_results$xgf_drop_pct,
+      0.975,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$xga_increase_pct,
+      0.975,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$pk_xga_increase_pct,
+      0.975,
+      na.rm = TRUE
+    ),
+
+    quantile(
+      boot_results$relative_size_pct,
+      0.975,
+      na.rm = TRUE
+    )
+  )
+)
+
+
+bootstrap_ci[
+  ,
+  `:=`(
+    estimate = round(
+      estimate,
+      2
+    ),
+
+    lower_95 = round(
+      lower_95,
+      2
+    ),
+
+    upper_95 = round(
+      upper_95,
+      2
+    )
+  )
+]
+
+bootstrap_ci
+```
+
+```{r}
+short <- shift_effect[shift_length_group == "0-30"]
+long  <- shift_effect[shift_length_group == "60+"]
+
+margin_diff <- margin_results[
+  result == "60+ minus 0-30"
+]
+
+xgf_ci <- bootstrap_ci[
+  measure == "xGF decrease: 0-30 vs 60+"
+]
+
+xga_ci <- bootstrap_ci[
+  measure == "xGA increase: 0-30 vs 60+"
+]
+
+results_table <- data.table(
+  Metric = c("xGF", "xGA", "xG margin"),
+
+  `0-30 seconds` = sprintf(
+    "%.6f",
+    c(short$xGF, short$xGA, short$xG_margin)
+  ),
+
+  `60+ seconds` = sprintf(
+    "%.6f",
+    c(long$xGF, long$xGA, long$xG_margin)
+  ),
+
+  Change = c(
+    sprintf("-%.1f%%", xgf_ci$estimate),
+    sprintf("+%.1f%%", xga_ci$estimate),
+    sprintf("%.6f", margin_diff$estimate)
+  ),
+
+  `95% CI for change` = c(
+    sprintf(
+      "-%.1f%% to -%.1f%%",
+      xgf_ci$upper_95,
+      xgf_ci$lower_95
+    ),
+    sprintf(
+      "+%.1f%% to +%.1f%%",
+      xga_ci$lower_95,
+      xga_ci$upper_95
+    ),
+    sprintf(
+      "%.6f to %.6f",
+      margin_diff$lower,
+      margin_diff$upper
+    )
+  )
+)
+
+library(gt)
+
+results_gt <- results_table |>
+  gt() |>
+
+  # Table title and subtitle
+  tab_header(
+    title = md("**5v5 Expected Goals by Unit Shift Age**"),
+    subtitle = "Comparison of short (0–30 sec) and long (60+ sec) shifts"
+  ) |>
+
+  # Bold column headers
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(
+      columns = everything()
+    )
+  ) |>
+
+  # Bold metric names
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = Metric
+    )
+  ) |>
+
+  # Light blue-gray header
+  tab_style(
+    style = cell_fill(color = "#E9EFF5"),
+    locations = cells_column_labels(
+      columns = everything()
+    )
+  ) |>
+
+  # Subtle alternating rows
+  opt_row_striping(
+    row_striping = TRUE
+  ) |>
+
+  # Align metric names left
+  cols_align(
+    align = "left",
+    columns = Metric
+  ) |>
+
+  # Align numeric results centrally
+  cols_align(
+    align = "center",
+    columns = -Metric
+  ) |>
+
+  # Table font and sizing
+  tab_options(
+  table.font.names = "Arial",
+
+  # Main table text
+  table.font.size = px(17),
+
+  # Title and subtitle
+  heading.title.font.size = px(23),
+  heading.subtitle.font.size = px(16),
+
+  # Column headers
+  column_labels.font.size = px(17),
+
+  # Spacing between rows
+  data_row.padding = px(14),
+
+  # Table borders
+  table.border.top.color = "#334155",
+  table.border.bottom.color = "#334155"
+) |>
+
+  # Methodological note
+  tab_source_note(
+    source_note = md(
+      paste0(
+        "**Note:** Values represent average xG per ",
+        "five-second team interval. ",
+        "Percentage confidence intervals were calculated ",
+        "using game-level bootstrapping (1,000 resamples). ",
+        "The xG margin difference uses game-clustered ",
+        "standard errors."
+      )
+    )
+  )
+
+# Display table
+results_gt
+
+# Save as PNG
+gt::gtsave(
+  results_gt,
+  "../images/shift_comparison_table.png",
+  vwidth = 1100,
+  expand = 15
+)
+
+results_gt
+
+gt::gtsave(
+  results_gt,
+  "../images/shift_comparison_table.png",
+  vwidth = 1000,
+  expand = 10
+)
+```
+
+
+
+

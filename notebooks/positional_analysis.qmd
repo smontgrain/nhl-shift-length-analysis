@@ -1,0 +1,799 @@
+---
+title: "position_shift_length_analysis"
+format: html
+---
+
+# Setup
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+team_5v5 <- fread(
+  "nhl_2025_26_team_interval_5v5.csv"
+)
+
+setDT(team_5v5)
+
+required_columns <- c(
+  "game_id",
+  "team",
+  "period",
+  "interval_start",
+  "mean_forward_shift_age_sec",
+  "mean_defense_shift_age_sec",
+  "xGF_5v5",
+  "xGA_5v5"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  names(team_5v5)
+)
+
+if (length(missing_columns) > 0L) {
+  stop(
+    "Missing required columns: ",
+    paste(
+      missing_columns,
+      collapse = ", "
+    )
+  )
+}
+
+team_5v5[
+  ,
+  xg_margin := xGF_5v5 - xGA_5v5
+]
+
+cat(
+  "5v5 team intervals:",
+  nrow(team_5v5),
+  "\n"
+)
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# 1. Forward shift age vs xG margin
+# ------------------------------------------------------------
+
+BIN_SECONDS <- 5L
+
+team_5v5[
+  ,
+  forward_shift_bin :=
+    BIN_SECONDS *
+    floor(
+      mean_forward_shift_age_sec /
+        BIN_SECONDS
+    )
+]
+
+forward_summary <- team_5v5[
+  forward_shift_bin <= 90,
+  .(
+    mean_margin =
+      mean(
+        xg_margin,
+        na.rm = TRUE
+      ),
+
+    mean_xGF =
+      mean(
+        xGF_5v5,
+        na.rm = TRUE
+      ),
+
+    mean_xGA =
+      mean(
+        xGA_5v5,
+        na.rm = TRUE
+      ),
+
+    n_intervals = .N,
+    n_games =
+      uniqueN(game_id)
+  ),
+  by = forward_shift_bin
+]
+
+setorder(
+  forward_summary,
+  forward_shift_bin
+)
+
+ggplot(
+  forward_summary,
+  aes(
+    x = forward_shift_bin,
+    y = mean_margin
+  )
+) +
+  geom_line(
+    linewidth = 1
+  ) +
+  geom_point(
+    size = 1.5
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "5v5 xG Margin by Forward Shift Age",
+    x = "Average forward shift age (seconds)",
+    y = "Average xGF - xGA per 5-second interval"
+  ) +
+  theme_bw()
+
+
+# ------------------------------------------------------------
+# 2. Defense shift age vs xG margin
+# ------------------------------------------------------------
+
+team_5v5[
+  ,
+  defense_shift_bin :=
+    BIN_SECONDS *
+    floor(
+      mean_defense_shift_age_sec /
+        BIN_SECONDS
+    )
+]
+
+defense_summary <- team_5v5[
+  defense_shift_bin <= 90,
+  .(
+    mean_margin =
+      mean(
+        xg_margin,
+        na.rm = TRUE
+      ),
+
+    mean_xGF =
+      mean(
+        xGF_5v5,
+        na.rm = TRUE
+      ),
+
+    mean_xGA =
+      mean(
+        xGA_5v5,
+        na.rm = TRUE
+      ),
+
+    n_intervals = .N,
+    n_games =
+      uniqueN(game_id)
+  ),
+  by = defense_shift_bin
+]
+
+setorder(
+  defense_summary,
+  defense_shift_bin
+)
+
+ggplot(
+  defense_summary,
+  aes(
+    x = defense_shift_bin,
+    y = mean_margin
+  )
+) +
+  geom_line(
+    linewidth = 1
+  ) +
+  geom_point(
+    size = 1.5
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "5v5 xG Margin by Defensemen Shift Age",
+    x = "Average defensemen shift age (seconds)",
+    y = "Average xGF - xGA per 5-second interval"
+  ) +
+  theme_bw()
+
+# ------------------------------------------------------------
+# Overlay forward and defense shift-age curves
+# ------------------------------------------------------------
+
+position_plot_data <- rbind(
+  forward_summary[
+    ,
+    .(
+      shift_age_bin = forward_shift_bin,
+      mean_margin,
+      n_intervals,
+      n_games,
+      position = "Forwards"
+    )
+  ],
+
+  defense_summary[
+    ,
+    .(
+      shift_age_bin = defense_shift_bin,
+      mean_margin,
+      n_intervals,
+      n_games,
+      position = "Defensemen"
+    )
+  ]
+)
+
+setorder(
+  position_plot_data,
+  position,
+  shift_age_bin
+)
+
+positional_graph <- ggplot(
+  position_plot_data[
+    shift_age_bin <= 90
+  ],
+  aes(
+    x = shift_age_bin,
+    y = mean_margin,
+    color = position
+  )
+) +
+  geom_line(
+    linewidth = 1
+  ) +
+  geom_point(
+    size = 1.5
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Forwards" = "steelblue",
+      "Defensemen" = "firebrick"
+    )
+  ) +
+  labs(
+    title = "5v5 xG Margin by Forward and Defensemen Shift Age",
+    subtitle = "xG Margin",
+    x = "Average shift age (5-seconds bins)",
+    y = "",
+    color = NULL
+  ) +
+  theme_bw()
+
+ggsave(
+  "../images/positional_graph.png",
+  plot = positional_graph,
+  width = 7,
+  height = 4.5,
+  dpi = 300
+)
+```
+Correlation of 0.5 means this doesnt matter all that much
+
+
+#Model
+```{r}
+# ------------------------------------------------------------
+# 3. Forward vs defense effect in the same model
+# ------------------------------------------------------------
+
+position_model_data <- team_5v5[
+  mean_forward_shift_age_sec <= 90 &
+    mean_defense_shift_age_sec <= 90 &
+    !is.na(mean_forward_shift_age_sec) &
+    !is.na(mean_defense_shift_age_sec) &
+    !is.na(xg_margin)
+]
+
+m_position <- lm(
+  xg_margin ~
+    mean_forward_shift_age_sec +
+    mean_defense_shift_age_sec,
+  data = position_model_data
+)
+
+position_test <- coeftest(
+  m_position,
+  vcov = vcovCL(
+    m_position,
+    cluster = ~ game_id
+  )
+)
+
+position_test
+
+cor(
+  team_5v5$mean_forward_shift_age_sec,
+  team_5v5$mean_defense_shift_age_sec,
+  use = "complete.obs"
+)
+
+library(car)
+
+vif(
+  lm(
+    xg_margin ~
+      mean_forward_shift_age_sec +
+      mean_defense_shift_age_sec,
+    data = position_model_data
+  )
+)
+```
+
+#testing if they are different
+```{r}
+# ------------------------------------------------------------
+# 4. Test whether forward and defense slopes differ
+# ------------------------------------------------------------
+
+V_position <- vcovCL(
+  m_position,
+  cluster = ~ game_id
+)
+
+b_position <- coef(m_position)
+
+slope_difference <-
+  b_position[
+    "mean_forward_shift_age_sec"
+  ] -
+  b_position[
+    "mean_defense_shift_age_sec"
+  ]
+
+se_slope_difference <- sqrt(
+  V_position[
+    "mean_forward_shift_age_sec",
+    "mean_forward_shift_age_sec"
+  ] +
+    V_position[
+      "mean_defense_shift_age_sec",
+      "mean_defense_shift_age_sec"
+    ] -
+    2 *
+    V_position[
+      "mean_forward_shift_age_sec",
+      "mean_defense_shift_age_sec"
+    ]
+)
+
+z_difference <-
+  slope_difference /
+  se_slope_difference
+
+p_difference <-
+  2 *
+  pnorm(
+    abs(z_difference),
+    lower.tail = FALSE
+  )
+
+position_comparison <- data.table(
+  forward_slope =
+    b_position[
+      "mean_forward_shift_age_sec"
+    ],
+
+  defense_slope =
+    b_position[
+      "mean_defense_shift_age_sec"
+    ],
+
+  slope_difference =
+    slope_difference,
+
+  se_difference =
+    se_slope_difference,
+
+  z =
+    z_difference,
+
+  p_value =
+    p_difference
+)
+
+position_comparison
+
+position_comparison[
+  ,
+  `:=`(
+    lower_95 =
+      slope_difference -
+      1.96 * se_difference,
+
+    upper_95 =
+      slope_difference +
+      1.96 * se_difference
+  )
+]
+
+position_comparison
+
+position_comparison[
+  ,
+  `:=`(
+    difference_per_30_sec =
+      slope_difference * 30,
+
+    lower_95_30_sec =
+      lower_95 * 30,
+
+    upper_95_30_sec =
+      upper_95 * 30
+  )
+]
+
+position_comparison
+```
+Although the unadjusted forward and defensemen curves were similar, the joint regression showed a substantially stronger negative association between defensemen shift age and team xG performance after accounting for the shift age of the forwards. An additional 30 seconds of average defensemen shift age was associated with approximately 0.00056 lower xGF and 0.00028 higher xGA per five-second interval, resulting in a net decline in xG margin of about 0.00084 (95% CI: −0.00092 to −0.00075). In contrast, an additional 30 seconds of forward shift age was associated with a small positive conditional change in xG margin of 0.00016 (95% CI: 0.00007 to 0.00024). After accounting for defensemen shift age, longer forward shifts were associated with both increased xGF and increased xGA, producing a small positive net association with xG margin. This may reflect differences in the game situations in which forwards and defensemen accumulate long shifts rather than improved performance caused by additional time on ice. For example, a team where all the players have been on the ice for 40 seconds may represent typical game flow, but a a team where the forwards are fresh but the defenseman have been on for 40 seconds may signify the opposing team having posession and the forwards taking a quick change while the defenseman remain trapped. The difference between the forward and defensemen associations was statistically significant, corresponding to a difference of approximately 0.00099 in xG margin per additional 30 seconds of shift age (95% CI: 0.00084 to 0.00115, p < 0.001).
+
+This may reflect the greater difficulty defensemen face in leaving the ice during sustained defensive-zone pressure, meaning that long defense shifts could be both a consequence and a signal of unfavorable game conditions. Therefore, the observational design cannot determine whether this relationship is primarily due to fatigue, game context, or a combination of both.
+
+
+
+```{r}
+# ============================================================
+# POSITIONAL ANALYSIS: xGF AND xGA SEPARATELY
+# ============================================================
+
+library(sandwich)
+library(lmtest)
+
+# Use the same supported range and same rows as the positional model
+position_model_data <- team_5v5[
+  mean_forward_shift_age_sec <= 90 &
+    mean_defense_shift_age_sec <= 90 &
+    !is.na(mean_forward_shift_age_sec) &
+    !is.na(mean_defense_shift_age_sec) &
+    !is.na(xGF_5v5) &
+    !is.na(xGA_5v5)
+]
+
+
+# ------------------------------------------------------------
+# 1. xGF model
+# ------------------------------------------------------------
+
+m_position_xgf <- lm(
+  xGF_5v5 ~
+    mean_forward_shift_age_sec +
+    mean_defense_shift_age_sec,
+  data = position_model_data
+)
+
+xgf_position_test <- coeftest(
+  m_position_xgf,
+  vcov = vcovCL(
+    m_position_xgf,
+    cluster = ~ game_id
+  )
+)
+
+xgf_position_test
+
+
+# ------------------------------------------------------------
+# 2. xGA model
+# ------------------------------------------------------------
+
+m_position_xga <- lm(
+  xGA_5v5 ~
+    mean_forward_shift_age_sec +
+    mean_defense_shift_age_sec,
+  data = position_model_data
+)
+
+xga_position_test <- coeftest(
+  m_position_xga,
+  vcov = vcovCL(
+    m_position_xga,
+    cluster = ~ game_id
+  )
+)
+
+xga_position_test
+
+
+# ------------------------------------------------------------
+# 3. Easier interpretation:
+#    estimated change over an additional 30 seconds
+# ------------------------------------------------------------
+
+xgf_forward_30 <-
+  coef(m_position_xgf)[
+    "mean_forward_shift_age_sec"
+  ] * 30
+
+xgf_defense_30 <-
+  coef(m_position_xgf)[
+    "mean_defense_shift_age_sec"
+  ] * 30
+
+xga_forward_30 <-
+  coef(m_position_xga)[
+    "mean_forward_shift_age_sec"
+  ] * 30
+
+xga_defense_30 <-
+  coef(m_position_xga)[
+    "mean_defense_shift_age_sec"
+  ] * 30
+
+
+position_30sec_effects <- data.table(
+  outcome = c(
+    "xGF",
+    "xGF",
+    "xGA",
+    "xGA"
+  ),
+
+  position = c(
+    "Forwards",
+    "Defensemen",
+    "Forwards",
+    "Defensemen"
+  ),
+
+  change_per_30_sec = c(
+    xgf_forward_30,
+    xgf_defense_30,
+    xga_forward_30,
+    xga_defense_30
+  )
+)
+
+position_30sec_effects
+```
+
+#CI
+
+```{r}
+# ============================================================
+# 95% CIs for 30-second positional effects
+# ============================================================
+
+# Clustered covariance matrices
+V_xgf <- vcovCL(
+  m_position_xgf,
+  cluster = ~ game_id
+)
+
+V_xga <- vcovCL(
+  m_position_xga,
+  cluster = ~ game_id
+)
+
+# Function to calculate a 30-second effect and CI
+get_30sec_effect <- function(model, V, variable) {
+
+  estimate <- coef(model)[variable] * 30
+
+  se <- sqrt(
+    V[variable, variable]
+  ) * 30
+
+  data.table(
+    estimate = estimate,
+    lower_95 = estimate - 1.96 * se,
+    upper_95 = estimate + 1.96 * se
+  )
+}
+
+# xGF
+xgf_forward_ci <- get_30sec_effect(
+  m_position_xgf,
+  V_xgf,
+  "mean_forward_shift_age_sec"
+)
+
+xgf_defense_ci <- get_30sec_effect(
+  m_position_xgf,
+  V_xgf,
+  "mean_defense_shift_age_sec"
+)
+
+# xGA
+xga_forward_ci <- get_30sec_effect(
+  m_position_xga,
+  V_xga,
+  "mean_forward_shift_age_sec"
+)
+
+xga_defense_ci <- get_30sec_effect(
+  m_position_xga,
+  V_xga,
+  "mean_defense_shift_age_sec"
+)
+
+# Combine into one table
+position_effect_ci <- rbind(
+  cbind(
+    outcome = "xGF",
+    position = "Forwards",
+    xgf_forward_ci
+  ),
+
+  cbind(
+    outcome = "xGF",
+    position = "Defensemen",
+    xgf_defense_ci
+  ),
+
+  cbind(
+    outcome = "xGA",
+    position = "Forwards",
+    xga_forward_ci
+  ),
+
+  cbind(
+    outcome = "xGA",
+    position = "Defensemen",
+    xga_defense_ci
+  )
+)
+
+position_effect_ci
+
+V_margin <- vcovCL(
+  m_position,
+  cluster = ~ game_id
+)
+
+margin_forward_ci <- get_30sec_effect(
+  m_position,
+  V_margin,
+  "mean_forward_shift_age_sec"
+)
+
+margin_defense_ci <- get_30sec_effect(
+  m_position,
+  V_margin,
+  "mean_defense_shift_age_sec"
+)
+
+margin_forward_ci
+margin_defense_ci
+
+
+library(data.table)
+library(gt)
+
+# ------------------------------------------------------------
+# 1. Combine existing estimates and confidence intervals
+# ------------------------------------------------------------
+
+margin_ci_table <- rbindlist(list(
+  data.table(
+    outcome = "xG margin",
+    position = "Forwards",
+    margin_forward_ci
+  ),
+  data.table(
+    outcome = "xG margin",
+    position = "Defensemen",
+    margin_defense_ci
+  )
+))
+
+library(gt)
+library(data.table)
+
+# Format estimate and CI on separate lines
+all_position_ci[
+  ,
+  formatted := sprintf(
+    "<strong>%+.6f</strong><br><span style='font-size:14px; color:#64748B;'>(%.6f to %.6f)</span>",
+    estimate,
+    lower_95,
+    upper_95
+  )
+]
+
+# Create wide table
+position_results_table <- dcast(
+  all_position_ci,
+  outcome ~ position,
+  value.var = "formatted"
+)
+
+setnames(position_results_table, "outcome", "Metric")
+
+# Order rows
+position_results_table[
+  ,
+  Metric := factor(
+    Metric,
+    levels = c("xGF", "xGA", "xG margin")
+  )
+]
+
+setorder(position_results_table, Metric)
+
+position_results_table[
+  ,
+  Metric := as.character(Metric)
+]
+
+# Create formatted table
+position_gt <- position_results_table |>
+  gt() |>
+  fmt_markdown(
+    columns = c(Forwards, Defensemen)
+  ) |>
+  tab_header(
+    title = md("**5v5 Expected Goals by Position Group**"),
+    subtitle = "Estimated change per additional 30 seconds of shift age"
+  ) |>
+  cols_move(
+    columns = Forwards,
+    after = Metric
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(
+      columns = everything()
+    )
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(columns = Metric)
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#E9EFF5"),
+    locations = cells_column_labels(
+      columns = everything()
+    )
+  ) |>
+  opt_row_striping(row_striping = TRUE) |>
+  cols_align(
+    align = "left",
+    columns = Metric
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(Forwards, Defensemen)
+  ) |>
+  tab_options(
+    table.font.names = "Arial",
+    table.font.size = px(18),
+    heading.title.font.size = px(23),
+    heading.subtitle.font.size = px(16),
+    column_labels.font.size = px(18),
+    data_row.padding = px(18),
+    table.border.top.color = "#334155",
+    table.border.bottom.color = "#334155"
+  ) |>
+  tab_source_note(
+    source_note = md(
+      paste0(
+        "**Note:** Values show estimated changes in xG per ",
+        "five-second team interval. Parentheses contain 95% ",
+        "confidence intervals. Estimates hold the other position ",
+        "group's shift age constant. Standard errors are clustered by game."
+      )
+    )
+  )
+
+position_gt
+
+gt::gtsave(
+  position_gt,
+  "../images/position_comparison_table.png",
+  vwidth = 900,
+  expand = 15
+)
+```
+

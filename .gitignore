@@ -1,0 +1,34 @@
+# Data caches
+shift_cache/
+pbp_cache_2025_26/
+roster_cache/
+roster_cache_all_games/
+moneypuck_data/
+
+# Large R data/cache files
+*.rds
+
+# MoneyPuck downloads
+shots_*.zip
+shots_*.csv
+
+# Generated datasets
+nhl_2025_26_player_shift_data.csv
+nhl_2025_26_dz_faceoff_events_all.csv
+nhl_2025_26_icing_faceoff_model_data.csv
+nhl_2025_26_icing_on_ice_players.csv
+flagged_long_shifts.csv
+
+# RStudio / Quarto generated state
+.Rproj.user/
+.quarto/
+README_files/
+.RData
+.Rhistory
+.Ruserdata
+
+# macOS
+.DS_Store
+._*
+/.quarto/
+**/*.quarto_ipynb
