@@ -1,12 +1,14 @@
 # NHL Shift Length and Expected Goal Performance
 
-An independent sports analytics project examining the relationship between NHL shift length and team expected-goal performance during the 2025–26 NHL season.
+An independent sports analytics project examining the relationship between NHL shift length and team expected goal performance during the 2025–26 NHL season.
+
+**[Read the Full Research Manuscript](https://smontgrain.github.io/nhl-shift-length-analysis/)** | **[Download PDF](paper/NHL_Shift_Length_Analysis.pdf)**
 
 ## Project Overview
 
-NHL broadcasts frequently highlight players who have been stuck on the ice for an extended shift, but how much of a disadvantage does this actually represent?
+NHL broadcasts frequently highlight players who have been stuck on the ice for an extended shift, but how much of a disadvantage does this actually create?
 
-This project investigates how team expected-goal performance changes as players remain on the ice longer, and whether the relationship differs between forwards and defensemen.
+This project investigates how team expected goal performance changes as players remain on the ice longer, and whether the relationship differs between forwards and defensemen.
 
 Using R, I combined NHL player shift data, play-by-play events, and MoneyPuck expected-goal data to reconstruct shifts and analyze team performance across five-second intervals.
 
@@ -28,17 +30,12 @@ These findings describe statistical associations rather than causal effects, as 
 
 ## Repository Structure
 
-- `index.qmd` — Complete research manuscript
+- `index.qmd` — Complete research manuscript source
+- `paper/` — Downloadable PDF manuscript
 - `R/` — Data collection, processing, and validation scripts
 - `notebooks/` — Statistical analysis and visualization code
 - `images/` — Figures and summary tables
 - `references.bib` — Research references and data-source citations
-
-## Read the Full Paper
-
-The complete manuscript is available in `index.qmd`.
-
-A formatted HTML version will be available through GitHub Pages.
 
 ## Acknowledgements
 
